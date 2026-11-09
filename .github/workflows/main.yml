@@ -1,0 +1,313 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xvfb x11vnc openbox \
+            python3 wget curl unzip \
+            openjdk-17-jdk-headless \
+            nginx apache2-utils \
+            novnc websockify
+
+      - name: Setup Android SDK command-line tools
+        run: |
+          SDK="$HOME/android-sdk"
+          mkdir -p "$SDK/cmdline-tools"
+          wget -q -O /tmp/ct.zip \
+            "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          unzip -q /tmp/ct.zip -d /tmp/ct_tmp
+          mv /tmp/ct_tmp/cmdline-tools "$SDK/cmdline-tools/latest"
+          printf '%s=%s\n' ANDROID_HOME "$SDK" ANDROID_SDK_ROOT "$SDK" >> "$GITHUB_ENV"
+          printf '%s\n' \
+            "$SDK/cmdline-tools/latest/bin" \
+            "$SDK/platform-tools" \
+            "$SDK/emulator" >> "$GITHUB_PATH"
+
+      - name: Accept licenses and install SDK packages
+        run: |
+          SM="$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          "$SM" \
+            "platform-tools" \
+            "emulator" \
+            "platforms;android-34" \
+            "system-images;android-34;google_apis;x86_64"
+
+      - name: Create AVD
+        run: |
+          AM="$HOME/android-sdk/cmdline-tools/latest/bin/avdmanager"
+          echo "no" | "$AM" create avd \
+            --name "S23" \
+            --package "system-images;android-34;google_apis;x86_64" \
+            --device "pixel_6_pro" \
+            --force
+
+      - name: Configure AVD hardware profile for Galaxy S23
+        run: |
+          CFG="$HOME/.android/avd/S23.avd/config.ini"
+          for k in hw.lcd.width hw.lcd.height hw.lcd.density hw.lcd.vsync \
+                    hw.ramSize hw.cpu.ncore hw.gpu.enabled hw.gpu.mode \
+                    hw.keyboard hw.mainKeys hw.arc; do
+            sed -i "/^${k}=/d" "$CFG"
+          done
+          cat >> "$CFG" << 'INI_END'
+hw.lcd.width=1080
+hw.lcd.height=2340
+hw.lcd.density=393
+hw.lcd.vsync=120
+hw.ramSize=8192
+hw.cpu.ncore=4
+hw.gpu.enabled=yes
+hw.gpu.mode=swiftshader_indirect
+hw.keyboard=yes
+hw.mainKeys=no
+hw.arc=false
+INI_END
+
+      - name: Start virtual display
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 +extension GLX +render -noreset &
+          sleep 2
+          DISPLAY=:99 openbox &
+          sleep 1
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      - name: Start emulator with S23 property set
+        run: |
+          export DISPLAY=:99
+          EMU="$HOME/android-sdk/emulator/emulator"
+          ADB="$HOME/android-sdk/platform-tools/adb"
+
+          "$EMU" -avd S23 \
+            -no-audio -no-boot-anim \
+            -gpu swiftshader_indirect \
+            -memory 8192 -cores 4 \
+            -no-snapshot -wipe-data -writable-system \
+            -camera-back none -camera-front none \
+            -accel on \
+            -prop ro.product.model=SM-S911B \
+            -prop ro.product.name=dm1qxxx \
+            -prop ro.product.device=dm1q \
+            -prop ro.product.brand=samsung \
+            -prop ro.product.manufacturer=samsung \
+            -prop ro.board.platform=kalama \
+            -prop ro.soc.manufacturer=Qualcomm \
+            -prop ro.soc.model=SM8550 \
+            -prop ro.hardware.chipname=SM8550 \
+            -prop ro.hardware.egl=adreno \
+            -prop "ro.vendor.qti.gpu.adreno_product_name=Adreno (TM) 740" \
+            -prop "ro.vendor.qti.gpu.adreno_product_code=0x43050200" \
+            -prop ro.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi \
+            -prop ro.product.cpu.abilist64=arm64-v8a \
+            -prop ro.product.cpu.abilist32=armeabi-v7a,armeabi \
+            -prop ro.oem.version=6.1 \
+            -prop ro.build.version.oneui=60100 \
+            -prop "ro.build.fingerprint=samsung/dm1qxxx/dm1q:14/UP1A.231005.007/S911BXXU7CXC3:user/release-keys" \
+            > /tmp/emu.log 2>&1 &
+
+          "$ADB" wait-for-device
+
+          BOOT=""
+          TRIES=0
+          while [ "$BOOT" != "1" ] && [ "$TRIES" -lt 90 ]; do
+            BOOT=$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n ')
+            TRIES=$((TRIES + 1))
+            sleep 5
+          done
+          echo "Boot: $BOOT ($((TRIES * 5))s)"
+
+      - name: Patch system partition for persistent S23 identity
+        run: |
+          ADB="$HOME/android-sdk/platform-tools/adb"
+
+          "$ADB" root
+          sleep 3
+          "$ADB" remount 2>/dev/null || true
+          "$ADB" shell "mount -o rw,remount /system" 2>/dev/null || true
+          sleep 2
+
+          "$ADB" pull /system/build.prop /tmp/orig.prop 2>/dev/null \
+            || "$ADB" shell "cat /system/build.prop" > /tmp/orig.prop
+
+          python3 << 'PYEOF'
+import re
+
+with open('/tmp/orig.prop', 'r', errors='replace') as f:
+    content = f.read()
+
+patches = {
+    'ro.product.model':                      'SM-S911B',
+    'ro.product.name':                       'dm1qxxx',
+    'ro.product.device':                     'dm1q',
+    'ro.product.brand':                      'samsung',
+    'ro.product.manufacturer':               'samsung',
+    'ro.board.platform':                     'kalama',
+    'ro.soc.manufacturer':                   'Qualcomm',
+    'ro.soc.model':                          'SM8550',
+    'ro.hardware.chipname':                  'SM8550',
+    'ro.hardware.egl':                       'adreno',
+    'ro.product.cpu.abilist':                'arm64-v8a,armeabi-v7a,armeabi',
+    'ro.product.cpu.abilist64':              'arm64-v8a',
+    'ro.product.cpu.abilist32':              'armeabi-v7a,armeabi',
+    'ro.oem.version':                        '6.1',
+    'ro.build.version.oneui':                '60100',
+    'ro.build.fingerprint':                  'samsung/dm1qxxx/dm1q:14/UP1A.231005.007/S911BXXU7CXC3:user/release-keys',
+    'ro.build.description':                  'dm1qxxx-user 14 UP1A.231005.007 S911BXXU7CXC3 release-keys',
+    'ro.vendor.qti.gpu.adreno_product_name': 'Adreno (TM) 740',
+    'ro.vendor.qti.gpu.adreno_product_code': '0x43050200',
+}
+
+for k, v in patches.items():
+    pat = rf'^{re.escape(k)}=.*$'
+    if re.search(pat, content, re.MULTILINE):
+        content = re.sub(pat, f'{k}={v}', content, flags=re.MULTILINE)
+    else:
+        content += f'\n{k}={v}'
+
+with open('/tmp/patched.prop', 'w') as f:
+    f.write(content)
+PYEOF
+
+          "$ADB" push /tmp/patched.prop /system/build.prop
+          "$ADB" shell "chmod 644 /system/build.prop"
+          "$ADB" reboot
+          sleep 15
+          "$ADB" wait-for-device
+
+          BOOT=""
+          TRIES=0
+          while [ "$BOOT" != "1" ] && [ "$TRIES" -lt 60 ]; do
+            BOOT=$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n ')
+            TRIES=$((TRIES + 1))
+            sleep 5
+          done
+          echo "Post-patch boot: $BOOT ($((TRIES * 5))s)"
+
+      - name: Configure display resolution, refresh rate, and GPU reporting
+        run: |
+          ADB="$HOME/android-sdk/platform-tools/adb"
+          "$ADB" root 2>/dev/null || true
+          sleep 2
+
+          "$ADB" shell wm size 1080x2340
+          "$ADB" shell wm density 393
+          "$ADB" shell settings put system peak_refresh_rate 120 2>/dev/null || true
+          "$ADB" shell settings put system min_refresh_rate 120 2>/dev/null || true
+          "$ADB" shell setprop ro.opengles.version 196610 2>/dev/null || true
+          "$ADB" shell setprop qemu.gles 1 2>/dev/null || true
+          "$ADB" shell setprop ro.kernel.qemu.gles 1 2>/dev/null || true
+
+          printf '\n--- device identity ---\n'
+          printf 'model      : '; "$ADB" shell getprop ro.product.model
+          printf 'brand      : '; "$ADB" shell getprop ro.product.brand
+          printf 'platform   : '; "$ADB" shell getprop ro.board.platform
+          printf 'soc        : '; "$ADB" shell getprop ro.soc.model
+          printf 'gpu        : '; "$ADB" shell getprop ro.vendor.qti.gpu.adreno_product_name
+          printf 'oneui ver  : '; "$ADB" shell getprop ro.build.version.oneui
+          printf 'fingerprint: '; "$ADB" shell getprop ro.build.fingerprint
+          printf '---\n'
+
+      - name: Setup NoVNC and nginx password gate
+        run: |
+          _P=$(printf '%s' "V2luZG93c1JEUDIwMjZA" | base64 -d)
+
+          x11vnc \
+            -display :99 \
+            -forever \
+            -rfbport 5900 \
+            -shared \
+            -noxdamage \
+            -localhost \
+            -bg \
+            -o /tmp/x11vnc.log
+          sleep 1
+
+          WS="websockify"
+          command -v websockify > /dev/null 2>&1 || WS="python3 -m websockify"
+          $WS --web /usr/share/novnc 127.0.0.1:6080 localhost:5900 \
+            > /tmp/ws.log 2>&1 &
+          sleep 1
+
+          _H=$(openssl passwd -apr1 "$_P")
+          printf 'admin:%s\n' "$_H" | sudo tee /etc/nginx/novnc.htpasswd > /dev/null
+
+          sudo tee /etc/nginx/conf.d/upgrade.conf > /dev/null << 'MAP'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+MAP
+
+          sudo tee /etc/nginx/sites-available/nvnc > /dev/null << 'NGCFG'
+server {
+    listen 7080 default_server;
+    server_name _;
+    auth_basic           "Session";
+    auth_basic_user_file /etc/nginx/novnc.htpasswd;
+    location / {
+        proxy_pass         http://127.0.0.1:6080;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    $http_upgrade;
+        proxy_set_header   Connection $connection_upgrade;
+        proxy_set_header   Host       $host;
+        proxy_read_timeout 86400;
+    }
+}
+NGCFG
+
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo ln -sf /etc/nginx/sites-available/nvnc \
+                      /etc/nginx/sites-enabled/nvnc
+          sudo nginx -t
+          sudo systemctl restart nginx
+
+      - name: Create Cloudflare tunnel
+        run: |
+          curl -sL \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb" \
+            -o /tmp/cfd.deb
+          sudo dpkg -i /tmp/cfd.deb
+
+          cloudflared tunnel --url http://localhost:7080 \
+            --no-autoupdate 2>&1 | tee /tmp/cfd.log &
+
+          sleep 12
+          URL=$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+            /tmp/cfd.log | head -1)
+          [ -z "$URL" ] && sleep 10 \
+            && URL=$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              /tmp/cfd.log | head -1)
+
+          printf '\n========================================\n'
+          printf '  %s/vnc.html\n' "${URL:-check /tmp/cfd.log}"
+          printf '========================================\n'
+
+      - name: Keepalive
+        run: |
+          n=0
+          while true; do
+            sleep 60
+            n=$((n + 1))
+            printf '[%s] alive %dm\n' "$(date -u +%T)" "$n"
+          done
